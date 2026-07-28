@@ -1,0 +1,48 @@
+# Виртуальное окружение
+venv/
+venv_win/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Переменные окружения
+.env
+.env.local
+.env.*.local
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Примеры (скриншоты и видео)
+examples/
+*.png
+*.jpg
+*.mp4
+
+# Временные файлы
+*.tmp
+*.temp
