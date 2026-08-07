@@ -7,8 +7,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Используем SQLite
-DATABASE_URL = "sqlite:///./chatbot.db"
+# Используем PostgreSQL
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "chatbot_db")
+DB_USER = os.getenv("DB_USER", "chatbot_user")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "chatbot_password")
+
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -22,10 +28,9 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 def init_db():
-    """Инициализация БД - создание таблиц"""
-    from app import models  # Импортируем модели перед созданием таблиц
+    from app import models
     Base.metadata.create_all(bind=engine)
-    print("✅ База данных инициализирована")
+    print("✅ База данных PostgreSQL инициализирована")
 
 # ============================================
 # ФУНКЦИИ ДЛЯ РАБОТЫ С ПОЛЬЗОВАТЕЛЯМИ

@@ -7,19 +7,29 @@ def seed_knowledge():
     
     knowledge_data = [
         {
-            "title": "Что такое MAX",
-            "content": "MAX - платформа для чат-ботов.",
-            "category": "Общее"
+            "title": "Авторизация в API hh.ru",
+            "content": "API hh.ru использует OAuth 2.0. Получите токен через https://hh.ru/oauth/token",
+            "category": "API hh.ru"
         },
         {
-            "title": "Yandex GPT",
-            "content": "Нейросеть для генерации текста.",
-            "category": "Технологии"
+            "title": "Поиск вакансий",
+            "content": "GET https://api.hh.ru/vacancies?text=Python&area=1",
+            "category": "API hh.ru"
         },
         {
-            "title": "Как задать вопрос",
-            "content": "Напишите сообщение в чат.",
-            "category": "Использование"
+            "title": "Создание резюме",
+            "content": "POST https://api.hh.ru/resumes с токеном авторизации",
+            "category": "API hh.ru"
+        },
+        {
+            "title": "Отклик на вакансию",
+            "content": "POST https://api.hh.ru/negotiations с vacancy_id и resume_id",
+            "category": "API hh.ru"
+        },
+        {
+            "title": "Список регионов",
+            "content": "GET https://api.hh.ru/areas для получения списка регионов",
+            "category": "API hh.ru"
         }
     ]
     

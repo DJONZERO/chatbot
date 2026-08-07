@@ -3,6 +3,7 @@ venv/
 venv_win/
 env/
 ENV/
+.venv/
 
 # Python
 __pycache__/
@@ -38,7 +39,6 @@ Thumbs.db
 desktop.ini
 
 # Примеры (скриншоты и видео)
-examples/
 *.png
 *.jpg
 *.mp4
@@ -46,3 +46,11 @@ examples/
 # Временные файлы
 *.tmp
 *.temp
+
+# Бинарные файлы
+*.whl
+
+# Скриншоты и видео (опционально)
+# examples/
+# *.png
+# *.mp4
