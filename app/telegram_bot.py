@@ -2,6 +2,7 @@ import os
 import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.request import HTTPXRequest
 from dotenv import load_dotenv
 
 from app.database import get_db, get_or_create_user, save_message, get_messages
@@ -24,19 +25,18 @@ class TelegramBot:
     
     def setup_handlers(self) -> None:
         """Настройка обработчиков команд"""
-        self.application = Application.builder().token(self.token).build()
+        self.application = Application.builder().token(self.token).connect_timeout(60).read_timeout(60).build()
         
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("help", self.help))
         self.application.add_handler(CommandHandler("history", self.history))
         self.application.add_handler(CommandHandler("knowledge", self.knowledge_search))
         self.application.add_handler(CommandHandler("max_status", self.max_status))
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(CommandHandler("update_knowledge", self.update_knowledge))
         
-        logger.info("✅ Обработчики команд настроены")
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /start"""
         user = update.effective_user
         db = next(get_db())
         db_user = get_or_create_user(db, user.id, user.username, user.first_name, user.last_name)
@@ -46,45 +46,33 @@ class TelegramBot:
         
         welcome_text = (
             f"👋 Привет, {user.first_name or 'User'}!\n\n"
-            "Я - помощник по API hh.ru и умный чат-бот на основе Yandex GPT.\n\n"
+            "Я — помощник по API hh.ru.\n\n"
             f"📡 MAX: {max_info}\n\n"
             "📚 Доступные команды:\n"
             "/start - Приветствие\n"
             "/help - Помощь\n"
             "/history - История сообщений\n"
             "/knowledge - Поиск в базе знаний\n"
-            "/max_status - Статус MAX интеграции\n\n"
-            "📖 Я могу ответить на вопросы по API hh.ru:\n"
-            "- Как авторизоваться?\n"
-            "- Как искать вакансии?\n"
-            "- Как создать резюме?\n"
-            "- Как откликнуться на вакансию?"
+            "/max_status - Статус MAX интеграции\n"
+            "/update_knowledge - Обновить базу знаний"
         )
         await update.message.reply_text(welcome_text)
         save_message(db, db_user.id, "/start", "user")
     
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /help"""
         help_text = (
-            "ℹ️ **Помощь по командам:**\n\n"
+            "ℹ️ Помощь:\n\n"
             "/start - Приветствие\n"
             "/help - Эта справка\n"
             "/history - История сообщений\n"
             "/knowledge - Поиск в базе знаний\n"
-            "/max_status - Статус MAX интеграции\n\n"
-            "📖 **Вопросы по API hh.ru:**\n"
-            "Просто спросите меня о:\n"
-            "- Авторизации в API hh.ru\n"
-            "- Поиске вакансий\n"
-            "- Создании резюме\n"
-            "- Откликах на вакансии\n"
-            "- Регионах и справочниках\n\n"
-            "💬 Или просто напишите сообщение, и я отвечу!"
+            "/max_status - Статус MAX интеграции\n"
+            "/update_knowledge - Обновить базу знаний\n\n"
+            "💬 Просто напишите сообщение, и я отвечу!"
         )
         await update.message.reply_text(help_text)
     
     async def max_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /max_status"""
         status = self.max.get_status()
         status_text = (
             "📡 **Статус MAX интеграции**\n\n"
@@ -96,7 +84,6 @@ class TelegramBot:
         await update.message.reply_text(status_text)
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик текстовых сообщений"""
         user = update.effective_user
         message_text = update.message.text
         
@@ -109,28 +96,21 @@ class TelegramBot:
         await update.message.chat.send_action(action="typing")
         
         try:
-            # Отправляем в MAX (если доступен)
-            if self.max.health_check():
-                self.max.send_message(str(user.id), message_text)
-            
-            # Генерируем ответ через Yandex Assistant (с поддержкой HH.ru)
             response = self.yandex.generate_response(message_text)
             save_message(db, db_user.id, response, "assistant")
             await update.message.reply_text(response)
-            
         except Exception as e:
             logger.error(f"Ошибка при обработке сообщения: {e}")
             await update.message.reply_text("Извините, произошла ошибка. Попробуйте позже.")
     
     async def history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /history"""
         user = update.effective_user
         db = next(get_db())
         db_user = get_or_create_user(db, user.id)
         messages = get_messages(db, db_user.id, limit=10)
         
         if not messages:
-            await update.message.reply_text("📭 История сообщений пуста.")
+            await update.message.reply_text("📭 История пуста.")
             return
         
         history_text = "📜 Последние сообщения:\n\n"
@@ -140,21 +120,47 @@ class TelegramBot:
         await update.message.reply_text(history_text)
     
     async def knowledge_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обработчик команды /knowledge"""
         if context.args:
             query = " ".join(context.args)
             db = next(get_db())
-            result = self.yandex.search_knowledge_base(db, query)
+            result = self.yandex.retriever.search(db, query)
             if result:
-                await update.message.reply_text(f"🔍 {result}")
+                text = "🔍 Найдено:\n\n"
+                for i, f in enumerate(result[:3], 1):
+                    text += f"[{i}] {f['title']}\n{f['content'][:200]}...\n\n"
+                await update.message.reply_text(text)
             else:
-                await update.message.reply_text("🔍 Ничего не найдено в базе знаний.")
+                await update.message.reply_text("🔍 Ничего не найдено.")
         else:
-            await update.message.reply_text(
-                "🔍 **Поиск в базе знаний**\n\n"
-                "Использование: `/knowledge <запрос>`\n"
-                "Пример: `/knowledge авторизация`"
-            )
+            await update.message.reply_text("🔍 /knowledge <запрос>\nПример: /knowledge вакансии")
+    
+    async def update_knowledge(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        admin_ids = os.getenv("ADMIN_TELEGRAM_IDS", "").split(",")
+        if str(user.id) not in admin_ids:
+            await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
+            return
+        
+        await update.message.reply_text("🔄 Начинаю обновление базы знаний...")
+        
+        try:
+            from app.doc_loader import DocLoader
+            doc_loader = DocLoader()
+            result = doc_loader.update_knowledge_base(update_type="manual")
+            
+            if result["status"] == "success":
+                await update.message.reply_text(
+                    f"✅ База знаний обновлена!\n\n"
+                    f"📊 Результаты:\n"
+                    f"- Добавлено: {result['added']} фрагментов\n"
+                    f"- Обновлено: {result['updated']} фрагментов\n"
+                    f"- Деактивировано: {result['deactivated']} фрагментов\n"
+                    f"- Всего активных: {result['total']}"
+                )
+            else:
+                await update.message.reply_text(f"❌ Ошибка обновления: {result.get('error', 'Неизвестная ошибка')}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
     
     async def start_bot(self) -> None:
         """Запуск бота"""

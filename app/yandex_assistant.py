@@ -3,7 +3,8 @@ import logging
 import requests
 from typing import Optional
 from dotenv import load_dotenv
-from app.hh_api import HHApiAssistant
+from app.retriever import Retriever
+from app.database import SessionLocal
 
 load_dotenv()
 
@@ -15,51 +16,61 @@ class YandexAssistant:
         self.folder_id = os.getenv("YANDEX_FOLDER_ID")
         self.model = os.getenv("YANDEX_MODEL", "yandexgpt-lite")
         self.use_yandex = False
-        self.hh_assistant = HHApiAssistant()
-
+        self.retriever = Retriever()
+        
         if self.api_key and self.folder_id:
             self.use_yandex = True
             logger.info("✅ Yandex Assistant инициализирован (режим API)")
-            print(f"✅ Yandex GPT включён. API_KEY: {self.api_key[:10]}... FOLDER_ID: {self.folder_id}")
         else:
             logger.warning("⚠️ Yandex Assistant работает в режиме заглушки")
-            print("⚠️ Режим заглушки: не найден API_KEY или FOLDER_ID")
-
+    
     def generate_response(self, prompt: str, context: Optional[str] = None) -> str:
-        """Генерация ответа с приоритетом YandexGPT"""
+        """Генерирует ответ с использованием Yandex GPT и RAG"""
         
-        # 1. Сначала пробуем YandexGPT
-        if self.use_yandex:
-            try:
-                response = self._generate_with_yandex(prompt, context)
-                # Если YandexGPT вернул осмысленный ответ — возвращаем его
-                if response and not response.startswith("⚠️"):
-                    return response
-            except Exception as e:
-                logger.error(f"Ошибка Yandex API: {e}")
+        # 1. Ищем в базе знаний через pgvector
+        db = SessionLocal()
+        try:
+            fragments = self.retriever.search(db, prompt)
+            if fragments:
+                context = self.retriever.build_context(fragments)
+                if context:
+                    return self._call_yandex_gpt_with_context(prompt, context)
+            else:
+                return "К сожалению, в документации API hh.ru не найдена информация по вашему запросу. Попробуйте переформулировать вопрос или обратитесь к официальной документации: https://api.hh.ru/openapi/redoc"
+        finally:
+            db.close()
         
-        # 2. Если YandexGPT не ответил — ищем в базе знаний
-        hh_answer = self.hh_assistant.find_answer(prompt)
-        if hh_answer:
-            return hh_answer
-        
-        # 3. Если ничего не найдено — заглушка
-        return self._get_stub_response(prompt)
-
-    def _generate_with_yandex(self, prompt: str, context: Optional[str] = None) -> str:
+        # Если Yandex недоступен
+        return "Извините, я не могу ответить на этот вопрос."
+    
+    def _call_yandex_gpt(self, prompt: str) -> str:
+        """Вызов Yandex GPT без контекста"""
+        messages = [
+            {"role": "user", "text": prompt}
+        ]
+        return self._call_yandex_api(messages)
+    
+    def _call_yandex_gpt_with_context(self, prompt: str, context: str) -> str:
+        """Вызов Yandex GPT с контекстом из базы знаний"""
+        messages = [
+            {
+                "role": "system",
+                "text": f"Ты — помощник по API hh.ru. Отвечай на вопросы, используя только информацию из контекста. Если в контексте нет ответа, скажи об этом честно.\n\nКонтекст:\n{context}"
+            },
+            {
+                "role": "user",
+                "text": prompt
+            }
+        ]
+        return self._call_yandex_api(messages)
+    
+    def _call_yandex_api(self, messages: list) -> str:
+        """Универсальный вызов Yandex GPT API"""
         url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
         headers = {
             "Authorization": f"Api-Key {self.api_key}",
             "Content-Type": "application/json"
         }
-
-        messages = [
-            {"role": "system", "text": "Ты — профессиональный помощник по API hh.ru. Отвечай понятно и полезно для обычного пользователя. Если вопрос не по теме hh.ru — вежливо скажи об этом."}
-        ]
-        if context:
-            messages.append({"role": "system", "text": f"Контекст из истории: {context}"})
-        messages.append({"role": "user", "text": prompt})
-
         payload = {
             "modelUri": f"gpt://{self.folder_id}/{self.model}",
             "completionOptions": {
@@ -69,9 +80,9 @@ class YandexAssistant:
             },
             "messages": messages
         }
-
+        
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
             
             if response.status_code == 200:
                 result = response.json()
@@ -81,16 +92,7 @@ class YandexAssistant:
                 return "Не удалось получить ответ от Yandex GPT."
             else:
                 logger.error(f"Ошибка Yandex API: {response.status_code} - {response.text}")
-                return f"⚠️ Ошибка YandexGPT: статус {response.status_code}"
+                return "Извините, произошла ошибка при обращении к Yandex GPT."
         except Exception as e:
-            logger.error(f"Ошибка при запросе к Yandex API: {e}")
-            return f"⚠️ Ошибка подключения к YandexGPT: {str(e)}"
-
-    def _get_stub_response(self, prompt: str) -> str:
-        return "🤖 Я — помощник по API hh.ru. Задайте мне вопрос, например: Как авторизоваться?"
-
-    def search_knowledge_base(self, db, query: str):
-        hh_answer = self.hh_assistant.find_answer(query)
-        if hh_answer:
-            return hh_answer
-        return None
+            logger.error(f"Ошибка при запросе к Yandex GPT: {e}")
+            return "Извините, произошла ошибка при обработке запроса."

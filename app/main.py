@@ -1,14 +1,14 @@
-import os
 import sys
+import os
 import logging
 import asyncio
 import warnings
 from pathlib import Path
 from datetime import datetime
 
-warnings.filterwarnings("ignore")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-sys.path.append(str(Path(__file__).parent.parent))
+warnings.filterwarnings("ignore")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -17,6 +17,8 @@ from app.database import init_db
 from app.telegram_bot import TelegramBot
 from app.max_integration import MAXIntegration
 from app.yandex_assistant import YandexAssistant
+from app.doc_loader import DocLoader
+from app.scheduler import start_scheduler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +49,12 @@ class ChatBotApp:
     async def start(self):
         logger.info("🚀 Запуск приложения...")
         self.init_database()
+        
+        # Запускаем планировщик
+        start_scheduler()
+        
         logger.info(f"📡 MAX: {'✅' if self.max_integration.health_check() else '⚠️ Заглушка'}")
+        logger.info(f"🤖 Yandex GPT: {'✅' if self.yandex_assistant.use_yandex else '⚠️ Заглушка'}")
         
         try:
             self.telegram_bot = TelegramBot()
@@ -55,10 +62,7 @@ class ChatBotApp:
             await self.telegram_bot.start_bot()
             self.is_running = True
             logger.info("✅ Бот запущен! Нажмите Ctrl+C для остановки.")
-            
-            # Ждем сигнала остановки
             await self._stop_event.wait()
-            
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
             raise
@@ -72,13 +76,12 @@ class ChatBotApp:
     def run(self):
         try:
             asyncio.run(self.start())
+            while self.is_running:
+                asyncio.sleep(1)
         except KeyboardInterrupt:
             logger.info("Получен сигнал остановки (Ctrl+C)")
             self._stop_event.set()
-            try:
-                asyncio.run(self.stop())
-            except Exception as e:
-                logger.error(f"Ошибка при остановке: {e}")
+            asyncio.run(self.stop())
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
             try:
