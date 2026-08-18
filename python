@@ -1,0 +1,84 @@
+from app.database import SessionLocal
+from app.models import DocFragment
+from app.doc_loader import create_embedding
+
+def add_auth_fragment():
+    db = SessionLocal()
+    
+    # Проверяем, есть ли уже такой фрагмент
+    existing = db.query(DocFragment).filter(
+        DocFragment.endpoint == '/oauth/token',
+        DocFragment.http_method == 'POST'
+    ).first()
+    
+    if existing:
+        print(f"✅ Фрагмент уже существует: {existing.title}")
+        print(f"   ID: {existing.id}")
+        db.close()
+        return
+    
+    # Создаем новый фрагмент
+    content = """POST /oauth/token
+Авторизация в API hh.ru через OAuth 2.0
+
+Шаги для получения access_token:
+
+1. Зарегистрируйте приложение:
+   - Перейдите на https://dev.hh.ru/admin/
+   - Создайте новое приложение
+   - Получите client_id и client_secret
+
+2. Получите authorization code:
+   - Перейдите по ссылке:
+   https://hh.ru/oauth/authorize?response_type=code&client_id=ВАШ_CLIENT_ID
+   - После авторизации вы получите code в параметрах URL
+
+3. Получите access_token:
+   Отправьте POST-запрос:
+   
+   POST https://hh.ru/oauth/token
+   Content-Type: application/x-www-form-urlencoded
+   
+   grant_type=authorization_code
+   &client_id=ВАШ_CLIENT_ID
+   &client_secret=ВАШ_CLIENT_SECRET
+   &code=ПОЛУЧЕННЫЙ_CODE
+
+4. В ответе вы получите:
+   {
+     "access_token": "ваш_токен",
+     "token_type": "bearer",
+     "expires_in": 3600,
+     "refresh_token": "токен_для_обновления"
+   }
+
+5. Используйте access_token в заголовках запросов:
+   Authorization: Bearer ваш_access_token
+
+Документация: https://dev.hh.ru/page/authorization"""
+
+    fragment = DocFragment(
+        title="POST /oauth/token - Как авторизоваться в API hh.ru",
+        content=content,
+        endpoint="/oauth/token",
+        http_method="POST",
+        source_url="https://dev.hh.ru/page/authorization",
+        section_path="POST_oauth_token_auth_explicit",
+        embedding=create_embedding(content),
+        is_active=True
+    )
+    
+    db.add(fragment)
+    db.commit()
+    db.refresh(fragment)
+    
+    print(f"✅ Добавлен новый фрагмент:")
+    print(f"   ID: {fragment.id}")
+    print(f"   Title: {fragment.title}")
+    print(f"   Endpoint: {fragment.endpoint}")
+    print(f"   Method: {fragment.http_method}")
+    
+    db.close()
+
+if __name__ == "__main__":
+    add_auth_fragment()

@@ -4,3 +4,10 @@ psycopg2-binary==2.9.9
 python-dotenv==1.0.0
 requests==2.31.0
 asyncpg==0.29.0
+pgvector==0.2.5
+sentence-transformers==2.2.2
+pyyaml==6.0.1
+schedule==1.2.0
+numpy==1.24.3
+torch==2.0.1
+transformers==4.35.2

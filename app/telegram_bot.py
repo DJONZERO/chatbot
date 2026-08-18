@@ -1,13 +1,13 @@
 import os
 import logging
+import re
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.request import HTTPXRequest
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-from app.database import get_db, get_or_create_user, save_message, get_messages
 from app.yandex_assistant import YandexAssistant
-from app.max_integration import MAXIntegration
+from app.database import SessionLocal
+from app.models import User, Message
 
 load_dotenv()
 
@@ -20,157 +20,262 @@ class TelegramBot:
             raise ValueError("TELEGRAM_BOT_TOKEN не установлен!")
         
         self.yandex = YandexAssistant()
-        self.max = MAXIntegration()
         self.application = None
+        self.admin_ids = [int(id.strip()) for id in os.getenv("ADMIN_TELEGRAM_IDS", "").split(",") if id.strip()]
+        logger.info(f"✅ TelegramBot инициализирован")
     
     def setup_handlers(self) -> None:
         """Настройка обработчиков команд"""
-        self.application = Application.builder().token(self.token).connect_timeout(60).read_timeout(60).build()
+        self.application = Application.builder().token(self.token).build()
         
+        # Регистрируем команды
         self.application.add_handler(CommandHandler("start", self.start))
         self.application.add_handler(CommandHandler("help", self.help))
         self.application.add_handler(CommandHandler("history", self.history))
         self.application.add_handler(CommandHandler("knowledge", self.knowledge_search))
-        self.application.add_handler(CommandHandler("max_status", self.max_status))
-        self.application.add_handler(CommandHandler("update_knowledge", self.update_knowledge))
+        self.application.add_handler(CommandHandler("stats", self.stats))
         
+        # Обработчик текстовых сообщений
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        
+        logger.info("✅ Обработчики зарегистрированы")
+    
+    def get_or_create_user(self, db, telegram_id: int, username: str = None, first_name: str = None, last_name: str = None) -> User:
+        """Получает или создает пользователя в БД"""
+        user = db.query(User).filter(User.telegram_id == telegram_id).first()
+        if not user:
+            user = User(
+                telegram_id=telegram_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            logger.info(f"👤 Создан новый пользователь: {telegram_id}")
+        return user
+    
+    def save_message(self, db, user_id: int, content: str, message_type: str) -> Message:
+        """Сохраняет сообщение в БД"""
+        msg = Message(
+            user_id=user_id,
+            content=content,
+            message_type=message_type
+        )
+        db.add(msg)
+        db.commit()
+        db.refresh(msg)
+        return msg
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Приветственное сообщение"""
         user = update.effective_user
-        db = next(get_db())
-        db_user = get_or_create_user(db, user.id, user.username, user.first_name, user.last_name)
         
-        max_status = self.max.get_status()
-        max_info = "✅ Доступен" if max_status["available"] else "⚠️ Недоступен (заглушка)"
+        db = SessionLocal()
+        try:
+            db_user = self.get_or_create_user(db, user.id, user.username, user.first_name, user.last_name)
+            self.save_message(db, db_user.id, "/start", "user")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении пользователя: {e}")
+        finally:
+            db.close()
         
         welcome_text = (
             f"👋 Привет, {user.first_name or 'User'}!\n\n"
             "Я — помощник по API hh.ru.\n\n"
-            f"📡 MAX: {max_info}\n\n"
-            "📚 Доступные команды:\n"
+            "📚 **Доступные команды:**\n"
             "/start - Приветствие\n"
             "/help - Помощь\n"
             "/history - История сообщений\n"
-            "/knowledge - Поиск в базе знаний\n"
-            "/max_status - Статус MAX интеграции\n"
-            "/update_knowledge - Обновить базу знаний"
+            "/knowledge <запрос> - Поиск в базе знаний\n"
+            "/stats - Статистика базы знаний\n\n"
+            "💬 Просто напишите сообщение, и я отвечу!"
         )
-        await update.message.reply_text(welcome_text)
-        save_message(db, db_user.id, "/start", "user")
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
     
     async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Справка по командам"""
         help_text = (
-            "ℹ️ Помощь:\n\n"
+            "ℹ️ **Помощь:**\n\n"
             "/start - Приветствие\n"
             "/help - Эта справка\n"
             "/history - История сообщений\n"
-            "/knowledge - Поиск в базе знаний\n"
-            "/max_status - Статус MAX интеграции\n"
-            "/update_knowledge - Обновить базу знаний\n\n"
-            "💬 Просто напишите сообщение, и я отвечу!"
+            "/knowledge <запрос> - Поиск в базе знаний\n"
+            "/stats - Статистика базы знаний\n\n"
+            "💬 Просто напишите сообщение, и я отвечу!\n\n"
+            "**Примеры вопросов:**\n"
+            "- Как найти вакансии?\n"
+            "- Как авторизоваться в API?\n"
+            "- Как создать резюме?\n"
+            "- Как откликнуться на вакансию?"
         )
-        await update.message.reply_text(help_text)
-    
-    async def max_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        status = self.max.get_status()
-        status_text = (
-            "📡 **Статус MAX интеграции**\n\n"
-            f"🟢 Доступность: {'✅ Да' if status['available'] else '❌ Нет (заглушка)'}\n"
-            f"🔗 API URL: {status['api_url']}\n"
-            f"🔑 API KEY: {status['api_key']}\n"
-            f"📋 Режим: {status['mode']}"
-        )
-        await update.message.reply_text(status_text)
+        await update.message.reply_text(help_text, parse_mode='Markdown')
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработка текстовых сообщений"""
         user = update.effective_user
         message_text = update.message.text
         
+        # Игнорируем команды
         if message_text.startswith('/'):
             return
         
-        db = next(get_db())
-        db_user = get_or_create_user(db, user.id, user.username, user.first_name, user.last_name)
-        save_message(db, db_user.id, message_text, "user")
-        await update.message.chat.send_action(action="typing")
+        logger.info(f"📩 Получено сообщение от {user.id}: {message_text[:50]}...")
+        
+        # Сохраняем сообщение пользователя
+        db = SessionLocal()
+        try:
+            db_user = self.get_or_create_user(db, user.id, user.username, user.first_name, user.last_name)
+            self.save_message(db, db_user.id, message_text, "user")
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении сообщения: {e}")
+        finally:
+            db.close()
         
         try:
-            response = self.yandex.generate_response(message_text)
-            save_message(db, db_user.id, response, "assistant")
-            await update.message.reply_text(response)
+            # Показываем, что бот печатает
+            await update.message.chat.send_action(action="typing")
         except Exception as e:
-            logger.error(f"Ошибка при обработке сообщения: {e}")
-            await update.message.reply_text("Извините, произошла ошибка. Попробуйте позже.")
+            logger.warning(f"Не удалось отправить typing action: {e}")
+        
+        try:
+            # Генерируем ответ
+            response = self.yandex.generate_response(message_text)
+            logger.info(f"📤 Ответ сгенерирован, длина: {len(response)} символов")
+            
+            # Сохраняем ответ
+            db = SessionLocal()
+            try:
+                db_user = self.get_or_create_user(db, user.id)
+                self.save_message(db, db_user.id, response, "assistant")
+            except Exception as e:
+                logger.error(f"Ошибка при сохранении ответа: {e}")
+            finally:
+                db.close()
+            
+            # Отправляем ответ с обработкой ошибок Markdown
+            try:
+                await update.message.reply_text(response, parse_mode='Markdown')
+            except Exception as e:
+                # Если ошибка Markdown, отправляем без форматирования
+                logger.warning(f"❌ Ошибка Markdown, отправляем без форматирования: {e}")
+                clean_response = re.sub(r'[*_`\[\]()~>#+\-=|{}.!]', '', response)
+                await update.message.reply_text(clean_response)
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при обработке сообщения: {e}")
+            import traceback
+            traceback.print_exc()
+            await update.message.reply_text(
+                "❌ Произошла ошибка при обработке запроса. Попробуйте позже."
+            )
     
     async def history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Показывает историю сообщений"""
         user = update.effective_user
-        db = next(get_db())
-        db_user = get_or_create_user(db, user.id)
-        messages = get_messages(db, db_user.id, limit=10)
         
-        if not messages:
-            await update.message.reply_text("📭 История пуста.")
-            return
-        
-        history_text = "📜 Последние сообщения:\n\n"
-        for msg in messages:
-            role = "👤 Вы" if msg.message_type == "user" else "🤖 Бот"
-            history_text += f"{role}: {msg.content[:100]}{'...' if len(msg.content) > 100 else ''}\n\n"
-        await update.message.reply_text(history_text)
+        db = SessionLocal()
+        try:
+            db_user = self.get_or_create_user(db, user.id)
+            
+            messages = db.query(Message).filter(
+                Message.user_id == db_user.id
+            ).order_by(Message.created_at.desc()).limit(10).all()
+            
+            if not messages:
+                await update.message.reply_text("📭 История пуста.")
+                return
+            
+            history_text = "📜 **Последние сообщения:**\n\n"
+            for msg in reversed(messages):
+                role = "👤 Вы" if msg.message_type == "user" else "🤖 Бот"
+                content = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+                history_text += f"{role}: {content}\n\n"
+            
+            await update.message.reply_text(history_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении истории: {e}")
+            await update.message.reply_text("❌ Ошибка при получении истории.")
+        finally:
+            db.close()
     
     async def knowledge_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if context.args:
-            query = " ".join(context.args)
-            db = next(get_db())
-            result = self.yandex.retriever.search(db, query)
-            if result:
-                text = "🔍 Найдено:\n\n"
-                for i, f in enumerate(result[:3], 1):
-                    text += f"[{i}] {f['title']}\n{f['content'][:200]}...\n\n"
-                await update.message.reply_text(text)
-            else:
-                await update.message.reply_text("🔍 Ничего не найдено.")
-        else:
-            await update.message.reply_text("🔍 /knowledge <запрос>\nПример: /knowledge вакансии")
-    
-    async def update_knowledge(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user = update.effective_user
-        admin_ids = os.getenv("ADMIN_TELEGRAM_IDS", "").split(",")
-        if str(user.id) not in admin_ids:
-            await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
+        """Поиск в базе знаний"""
+        if not context.args:
+            await update.message.reply_text(
+                "🔍 **Использование:** /knowledge <запрос>\n"
+                "Пример: /knowledge вакансии",
+                parse_mode='Markdown'
+            )
             return
         
-        await update.message.reply_text("🔄 Начинаю обновление базы знаний...")
-        
+        query = " ".join(context.args)
+        db = SessionLocal()
         try:
-            from app.doc_loader import DocLoader
-            doc_loader = DocLoader()
-            result = doc_loader.update_knowledge_base(update_type="manual")
+            results = self.yandex.retriever.search(db, query)
             
-            if result["status"] == "success":
+            if not results:
                 await update.message.reply_text(
-                    f"✅ База знаний обновлена!\n\n"
-                    f"📊 Результаты:\n"
-                    f"- Добавлено: {result['added']} фрагментов\n"
-                    f"- Обновлено: {result['updated']} фрагментов\n"
-                    f"- Деактивировано: {result['deactivated']} фрагментов\n"
-                    f"- Всего активных: {result['total']}"
+                    f"🔍 По запросу '{query}' ничего не найдено."
                 )
-            else:
-                await update.message.reply_text(f"❌ Ошибка обновления: {result.get('error', 'Неизвестная ошибка')}")
+                return
+            
+            text = f"🔍 **Результаты поиска по запросу:** '{query}'\n\n"
+            for i, f in enumerate(results[:5], 1):
+                text += f"**{i}. {f['title']}**\n"
+                text += f"{f['content'][:200]}...\n"
+                if f.get('source_url'):
+                    text += f"📖 Источник: {f['source_url']}\n"
+                text += "\n"
+            
+            if len(text) > 4000:
+                text = text[:3997] + "..."
+            
+            await update.message.reply_text(text, parse_mode='Markdown')
+            
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+            logger.error(f"Ошибка при поиске: {e}")
+            await update.message.reply_text("❌ Ошибка при поиске.")
+        finally:
+            db.close()
+    
+    async def stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Статистика базы знаний"""
+        db = SessionLocal()
+        try:
+            from app.models import DocFragment
+            count = db.query(DocFragment).filter(DocFragment.is_active == True).count()
+            
+            stats_text = (
+                f"📊 **Статистика базы знаний:**\n\n"
+                f"• Всего фрагментов: {count}\n"
+                f"• Источник: OpenAPI hh.ru\n"
+                f"📖 Документация: https://api.hh.ru/openapi/redoc"
+            )
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка при получении статистики: {e}")
+            await update.message.reply_text("❌ Ошибка при получении статистики.")
+        finally:
+            db.close()
     
     async def start_bot(self) -> None:
         """Запуск бота"""
         if not self.application:
             self.setup_handlers()
         
-        await self.application.initialize()
-        await self.application.start()
-        await self.application.updater.start_polling()
-        logger.info("🤖 Telegram бот запущен!")
+        try:
+            logger.info("🤖 Подключение к Telegram API...")
+            await self.application.initialize()
+            await self.application.start()
+            await self.application.updater.start_polling()
+            logger.info("🤖 Telegram бот запущен и готов к работе!")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при запуске бота: {e}")
+            raise
     
     async def stop_bot(self) -> None:
         """Остановка бота"""
@@ -181,8 +286,25 @@ class TelegramBot:
                     logger.info("🔄 Обновления остановлены")
                 
                 await self.application.stop()
+                await self.application.shutdown()
                 logger.info("🤖 Бот остановлен")
             except Exception as e:
-                logger.error(f"Ошибка при остановке бота: {e}")
-        else:
-            logger.warning("⚠️ Бот не был запущен")
+                logger.error(f"❌ Ошибка при остановке бота: {e}")
+
+
+# ============ Функция для запуска бота ============
+def run_bot():
+    """Запускает бота"""
+    import asyncio
+    
+    bot = TelegramBot()
+    bot.setup_handlers()
+    
+    try:
+        asyncio.run(bot.start_bot())
+        # Держим бота запущенным
+        asyncio.get_event_loop().run_forever()
+    except KeyboardInterrupt:
+        logger.info("👋 Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при запуске бота: {e}")

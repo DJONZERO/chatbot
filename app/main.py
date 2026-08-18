@@ -1,100 +1,110 @@
-import sys
 import os
+import sys
 import logging
 import asyncio
-import warnings
 from pathlib import Path
-from datetime import datetime
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-warnings.filterwarnings("ignore")
-
 from dotenv import load_dotenv
-load_dotenv()
 
-from app.database import init_db
+# Добавляем корневую директорию в путь
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from app.telegram_bot import TelegramBot
-from app.max_integration import MAXIntegration
-from app.yandex_assistant import YandexAssistant
+from app.database import init_db
 from app.doc_loader import DocLoader
-from app.scheduler import start_scheduler
 
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(f'bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log', encoding='utf-8')
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-class ChatBotApp:
+class Application:
     def __init__(self):
-        self.telegram_bot = None
-        self.max_integration = MAXIntegration()
-        self.yandex_assistant = YandexAssistant()
-        self.is_running = False
-        self._stop_event = asyncio.Event()
-    
-    def init_database(self):
+        load_dotenv()
+        self.bot = None
+        self.max_retries = 3
+        self.retry_delay = 5  # секунд
+        
+    async def start(self):
+        """Запуск приложения"""
         try:
+            logger.info("🚀 Запуск приложения...")
+            
+            # Инициализация базы данных
+            logger.info("🔄 Инициализация базы данных...")
             init_db()
             logger.info("✅ База данных инициализирована")
-        except Exception as e:
-            logger.error(f"❌ Ошибка БД: {e}")
-            raise
-    
-    async def start(self):
-        logger.info("🚀 Запуск приложения...")
-        self.init_database()
-        
-        # Запускаем планировщик
-        start_scheduler()
-        
-        logger.info(f"📡 MAX: {'✅' if self.max_integration.health_check() else '⚠️ Заглушка'}")
-        logger.info(f"🤖 Yandex GPT: {'✅' if self.yandex_assistant.use_yandex else '⚠️ Заглушка'}")
-        
-        try:
-            self.telegram_bot = TelegramBot()
-            self.telegram_bot.setup_handlers()
-            await self.telegram_bot.start_bot()
-            self.is_running = True
-            logger.info("✅ Бот запущен! Нажмите Ctrl+C для остановки.")
-            await self._stop_event.wait()
+            
+            # Проверка базы знаний
+            logger.info("🔄 Проверка базы знаний...")
+            db = None
+            try:
+                from app.database import SessionLocal
+                from app.models import DocFragment
+                db = SessionLocal()
+                count = db.query(DocFragment).filter(DocFragment.is_active == True).count()
+                logger.info(f"📚 В базе знаний {count} активных фрагментов")
+                
+                if count == 0:
+                    logger.warning("⚠️ База знаний пуста! Загружаем демонстрационные данные...")
+                    loader = DocLoader()
+                    result = loader.update_knowledge_base(update_type="manual")
+                    logger.info(f"✅ Результат загрузки: {result}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка при проверке базы знаний: {e}")
+            finally:
+                if db:
+                    db.close()
+            
+            # Создаем бота
+            self.bot = TelegramBot()
+            self.bot.setup_handlers()
+            
+            # Запускаем с повторными попытками
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    logger.info(f"🤖 Попытка {attempt}/{self.max_retries} запуска бота...")
+                    await self.bot.start_bot()
+                    break  # Успешно запустился
+                except Exception as e:
+                    logger.error(f"❌ Ошибка при запуске бота (попытка {attempt}): {e}")
+                    if attempt < self.max_retries:
+                        logger.info(f"⏳ Повтор через {self.retry_delay} секунд...")
+                        await asyncio.sleep(self.retry_delay)
+                    else:
+                        raise  # Последняя попытка не удалась
+            
+            # Держим приложение запущенным
+            while True:
+                await asyncio.sleep(1)
+            
+        except KeyboardInterrupt:
+            logger.info("👋 Приложение остановлено пользователем")
         except Exception as e:
             logger.error(f"❌ Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
             raise
     
     async def stop(self):
-        self.is_running = False
-        if self.telegram_bot:
-            await self.telegram_bot.stop_bot()
-        logger.info("🛑 Приложение остановлено")
+        """Остановка приложения"""
+        logger.info("🛑 Остановка приложения...")
+        if self.bot:
+            await self.bot.stop_bot()
+        logger.info("✅ Приложение остановлено")
     
     def run(self):
+        """Запуск приложения в синхронном режиме"""
         try:
             asyncio.run(self.start())
-            while self.is_running:
-                asyncio.sleep(1)
         except KeyboardInterrupt:
-            logger.info("Получен сигнал остановки (Ctrl+C)")
-            self._stop_event.set()
-            asyncio.run(self.stop())
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-            try:
-                asyncio.run(self.stop())
-            except Exception as e2:
-                logger.error(f"Ошибка при остановке: {e2}")
-            raise
+            logger.info("👋 Приложение остановлено пользователем")
+
+def main():
+    """Точка входа"""
+    app = Application()
+    app.run()
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("🤖 ЧАТ-БОТ С INTEGRATION MAX, YANDEX GPT, TELEGRAM")
-    print("=" * 60)
-    print(f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
-    app = ChatBotApp()
-    app.run()
+    main()

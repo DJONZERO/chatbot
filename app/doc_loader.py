@@ -2,13 +2,14 @@ import os
 import json
 import logging
 import requests
-import re
+import yaml
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session
 from app.models import DocFragment, KnowledgeUpdateLog
 from app.database import SessionLocal
 from sentence_transformers import SentenceTransformer
+from app.database import SessionLocal, Base
 
 logger = logging.getLogger(__name__)
 
@@ -22,10 +23,14 @@ def get_embedding_model():
 
 def create_embedding(text: str) -> List[float]:
     if not text:
-        return None
-    model = get_embedding_model()
-    embedding = model.encode(text[:1000])
-    return embedding.tolist()
+        return []
+    try:
+        model = get_embedding_model()
+        embedding = model.encode(text[:1000], normalize_embeddings=True)
+        return embedding.tolist()
+    except Exception as e:
+        logger.error(f"Ошибка создания embedding: {e}")
+        return []
 
 class DocLoader:
     def __init__(self):
@@ -36,127 +41,186 @@ class DocLoader:
         })
     
     def load_openapi_from_hh(self) -> List[Dict[str, Any]]:
-        """Загружает и парсит OpenAPI-спецификацию с hh.ru"""
+        """Загружает OpenAPI-спецификацию с официального источника HH.ru"""
         try:
-            urls = [
-                "https://api.hh.ru/openapi/redoc?format=json",
-                "https://api.hh.ru/openapi/redoc?format=yaml",
-            ]
+            url = "https://api.hh.ru/openapi/specification/public"
+            logger.info(f"Загрузка OpenAPI из: {url}")
             
-            for url in urls:
+            response = self.session.get(url, timeout=30)
+            
+            if response.status_code == 200:
                 try:
-                    logger.info(f"Загрузка OpenAPI из: {url}")
-                    response = self.session.get(url, timeout=30)
-                    
-                    if response.status_code == 200:
-                        # Пробуем парсить как JSON
-                        try:
-                            spec = response.json()
-                        except:
-                            # Если не JSON, пробуем YAML
-                            import yaml
-                            spec = yaml.safe_load(response.text)
-                        
-                        if not spec or "paths" not in spec:
-                            logger.warning("OpenAPI не содержит paths")
+                    spec = yaml.safe_load(response.text)
+                except:
+                    try:
+                        spec = response.json()
+                    except:
+                        logger.error("Не удалось распарсить OpenAPI")
+                        return []
+                
+                if not spec or "paths" not in spec:
+                    logger.warning("OpenAPI не содержит paths")
+                    return []
+                
+                fragments = []
+                
+                for path, path_item in spec.get("paths", {}).items():
+                    for method, operation in path_item.items():
+                        if method.lower() not in ["get", "post", "put", "delete", "patch"]:
                             continue
                         
-                        fragments = []
+                        summary = operation.get("summary", "")
+                        description = operation.get("description", "")
                         
-                        for path, path_item in spec.get("paths", {}).items():
-                            for method, operation in path_item.items():
-                                if method.lower() not in ["get", "post", "put", "delete", "patch"]:
-                                    continue
-                                
-                                summary = operation.get("summary", "")
-                                description = operation.get("description", "")
-                                
-                                content = f"{method.upper()} {path}\n{summary}\n{description}"
-                                
-                                if operation.get("parameters"):
-                                    content += "\nПараметры:\n"
-                                    for param in operation["parameters"]:
-                                        param_name = param.get('name', '')
-                                        param_desc = param.get('description', '')
-                                        content += f"- {param_name}: {param_desc}\n"
-                                
-                                if operation.get("requestBody"):
-                                    content += f"\nТело запроса: {operation['requestBody'].get('description', '')}\n"
-                                
-                                fragments.append({
-                                    "title": f"{method.upper()} {path}",
-                                    "content": content.strip(),
-                                    "endpoint": path,
-                                    "http_method": method.upper(),
-                                    "source_url": "https://api.hh.ru/openapi/redoc",
-                                    "section_path": f"{method.upper()}_{path}".replace('/', '_')
-                                })
+                        # Пропускаем слишком короткие описания
+                        if len(summary) < 5 and len(description) < 10:
+                            continue
                         
-                        if fragments:
-                            logger.info(f"✅ Загружено {len(fragments)} фрагментов из OpenAPI hh.ru")
-                            return fragments
-                        else:
-                            logger.warning("OpenAPI загружен, но фрагментов нет")
-                    
-                except Exception as e:
-                    logger.warning(f"Ошибка загрузки {url}: {e}")
-                    continue
-            
-            return []
-            
+                        content = f"{method.upper()} {path}\n{summary}\n{description}"
+                        
+                        if operation.get("parameters"):
+                            content += "\nПараметры:\n"
+                            for param in operation["parameters"]:
+                                param_name = param.get('name', '')
+                                param_desc = param.get('description', '')
+                                content += f"- {param_name}: {param_desc}\n"
+                        
+                        if operation.get("requestBody"):
+                            content += f"\nТело запроса: {operation['requestBody'].get('description', '')}\n"
+                        
+                        # Формируем безопасный section_path
+                        section_path = f"{method.upper()}_{path}".replace('/', '_').replace('{', '').replace('}', '')
+                        if len(section_path) > 200:
+                            section_path = section_path[:200]
+                        
+                        fragments.append({
+                            "title": f"{method.upper()} {path}",
+                            "content": content.strip(),
+                            "endpoint": path,
+                            "http_method": method.upper(),
+                            "source_url": "https://api.hh.ru/openapi/redoc",
+                            "section_path": section_path
+                        })
+                
+                # Добавляем ключевые фрагменты, которых может не быть в OpenAPI
+                self._add_missing_fragments(fragments)
+                
+                if fragments:
+                    logger.info(f"✅ Загружено {len(fragments)} фрагментов из OpenAPI hh.ru")
+                    return fragments
+                else:
+                    logger.warning("OpenAPI загружен, но фрагментов нет")
+                    return []
+            else:
+                logger.warning(f"OpenAPI вернул статус {response.status_code}")
+                return []
+                
         except Exception as e:
             logger.error(f"Ошибка загрузки OpenAPI: {e}")
             return []
     
-    def load_from_github(self) -> List[Dict[str, Any]]:
-        """Загружает документацию из GitHub репозитория hhru/api"""
-        fragments = []
+    def _add_missing_fragments(self, fragments: List[Dict[str, Any]]):
+        """Добавляет явные фрагменты, которых нет в OpenAPI"""
         
-        github_urls = [
-            "https://raw.githubusercontent.com/hhru/api/master/docs/openapi.yaml",
-            "https://raw.githubusercontent.com/hhru/api/master/openapi.yml",
-            "https://raw.githubusercontent.com/hhru/api/master/docs/openapi.json",
-        ]
+        # Проверяем наличие GET /vacancies
+        has_vacancies = any(
+            'vacancies' in f.get('endpoint', '').lower() and 
+            f.get('http_method') == 'GET' 
+            for f in fragments
+        )
         
-        for url in github_urls:
-            try:
-                logger.info(f"Загрузка из GitHub: {url}")
-                response = self.session.get(url, timeout=30)
-                if response.status_code == 200:
-                    content = response.text
-                    # Ищем пути в YAML/JSON
-                    paths = re.findall(r'/([a-z]+(?:_[a-z]+)*):', content)
-                    if paths:
-                        for path in set(paths[:20]):
-                            fragments.append({
-                                "title": f"API метод /{path}",
-                                "content": f"Документация API hh.ru: /{path}\nЭндпоинт: https://api.hh.ru/{path}",
-                                "endpoint": f"/{path}",
-                                "http_method": "GET",
-                                "source_url": url,
-                                "section_path": f"github_{path}"
-                            })
-                        if fragments:
-                            logger.info(f"Загружено {len(fragments)} фрагментов из GitHub")
-                            return fragments
-            except Exception as e:
-                logger.warning(f"Не удалось загрузить {url}: {e}")
-        
-        return fragments
-    
-    def _get_fallback_fragments(self) -> List[Dict[str, Any]]:
-        """Ручные фрагменты (запасной вариант)"""
-        return [
-            {
-                "title": "Авторизация в API hh.ru",
-                "content": """Авторизация в API hh.ru
+        if not has_vacancies:
+            fragments.append({
+                "title": "GET /vacancies - Поиск вакансий",
+                "content": """GET /vacancies
+Поиск вакансий в API hh.ru
 
-API hh.ru использует OAuth 2.0.
+Возвращает список вакансий, соответствующих параметрам поиска.
+
+Основные параметры:
+- text: Текст поиска (например, "Python разработчик")
+- area: ID региона (1 - Москва, 2 - Санкт-Петербург)
+- experience: Опыт работы (noExperience, between1And3, between3And6, moreThan6)
+- salary: Зарплата
+- employment: Тип занятости (full, part, project, volunteer, probation)
+- schedule: График работы (fullDay, shift, flexible, remote, flyInFlyOut)
+
+Пример запроса:
+GET https://api.hh.ru/vacancies?text=Python+разработчик&area=1
+
+Документация: https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij""",
+                "endpoint": "/vacancies",
+                "http_method": "GET",
+                "source_url": "https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij",
+                "section_path": "GET_vacancies_search"
+            })
+            logger.info("✅ Добавлен явный фрагмент для поиска вакансий")
+        
+        # Проверяем наличие POST /resumes
+        has_resume = any(
+            'resumes' in f.get('endpoint', '').lower() and 
+            f.get('http_method') == 'POST' 
+            for f in fragments
+        )
+        
+        if not has_resume:
+            fragments.append({
+                "title": "POST /resumes - Создание резюме",
+                "content": """POST /resumes
+Создание нового резюме в API hh.ru
+
+Для создания резюме необходимо отправить POST-запрос на /resumes с данными резюме в теле запроса.
+
+Обязательные поля:
+- first_name: Имя
+- last_name: Фамилия
+- position: Желаемая должность
+- salary: Желаемая зарплата
+- experience: Опыт работы
+
+Необязательные поля:
+- about: О себе
+- education: Образование
+- languages: Знание языков
+- skills: Навыки
+
+Пример запроса:
+POST https://api.hh.ru/resumes
+Authorization: Bearer {access_token}
+Content-Type: application/json
+
+{
+  "first_name": "Иван",
+  "last_name": "Иванов",
+  "position": "Python разработчик",
+  "salary": 150000
+}
+
+Документация: https://api.hh.ru/openapi/redoc#tag/Rezyume""",
+                "endpoint": "/resumes",
+                "http_method": "POST",
+                "source_url": "https://api.hh.ru/openapi/redoc#tag/Rezyume",
+                "section_path": "POST_resumes_create"
+            })
+            logger.info("✅ Добавлен явный фрагмент для создания резюме")
+        
+        # Проверяем наличие авторизации
+        has_auth = any(
+            'oauth' in f.get('endpoint', '').lower() or 
+            'авторизац' in f.get('content', '').lower()
+            for f in fragments
+        )
+        
+        if not has_auth:
+            fragments.append({
+                "title": "POST /oauth/token - Авторизация",
+                "content": """POST /oauth/token
+Авторизация в API hh.ru через OAuth 2.0
 
 Шаги для получения токена:
 1. Зарегистрируйте приложение: https://dev.hh.ru/admin/
 2. Получите client_id и client_secret
-3. Отправьте запрос на получение токена:
+3. Отправьте запрос:
 
 POST https://hh.ru/oauth/token
 Content-Type: application/x-www-form-urlencoded
@@ -172,29 +236,34 @@ grant_type=authorization_code
                 "endpoint": "/oauth/token",
                 "http_method": "POST",
                 "source_url": "https://dev.hh.ru/page/authorization",
-                "section_path": "Авторизация"
-            },
+                "section_path": "POST_oauth_token_auth"
+            })
+            logger.info("✅ Добавлен явный фрагмент для авторизации")
+    
+    def _get_fallback_fragments(self) -> List[Dict[str, Any]]:
+        """Ручные фрагменты (только для первого демонстрационного наполнения)"""
+        return [
             {
-                "title": "Поиск вакансий",
-                "content": """Поиск вакансий в API hh.ru
-
-GET https://api.hh.ru/vacancies
+                "title": "GET /vacancies - Поиск вакансий",
+                "content": """GET /vacancies
+Поиск вакансий в API hh.ru
 
 Параметры:
-- text — Текст поиска
-- area — ID региона (1 — Москва)
-- experience — Опыт работы
-- salary — Зарплата
+- text: Текст поиска
+- area: ID региона
+- experience: Опыт работы
+- salary: Зарплата
 
 Документация: https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij""",
                 "endpoint": "/vacancies",
                 "http_method": "GET",
                 "source_url": "https://api.hh.ru/openapi/redoc#tag/Poisk-vakansij",
-                "section_path": "Поиск_вакансий"
+                "section_path": "GET_vacancies_search_fallback"
             },
             {
-                "title": "Создание резюме",
-                "content": """Создание резюме в API hh.ru
+                "title": "POST /resumes - Создание резюме",
+                "content": """POST /resumes
+Создание резюме в API hh.ru
 
 POST https://api.hh.ru/resumes
 Authorization: Bearer {access_token}
@@ -203,11 +272,32 @@ Authorization: Bearer {access_token}
                 "endpoint": "/resumes",
                 "http_method": "POST",
                 "source_url": "https://api.hh.ru/openapi/redoc#tag/Rezyume",
-                "section_path": "Создание_резюме"
+                "section_path": "POST_resumes_create_fallback"
             },
             {
-                "title": "Отклик на вакансию",
-                "content": """Отклик на вакансию в API hh.ru
+                "title": "POST /oauth/token - Авторизация",
+                "content": """Авторизация в API hh.ru
+
+API hh.ru использует OAuth 2.0.
+
+POST https://hh.ru/oauth/token
+
+Параметры:
+- grant_type: authorization_code
+- client_id: ID приложения
+- client_secret: Секрет приложения
+- code: Код авторизации
+
+Документация: https://dev.hh.ru/page/authorization""",
+                "endpoint": "/oauth/token",
+                "http_method": "POST",
+                "source_url": "https://dev.hh.ru/page/authorization",
+                "section_path": "POST_oauth_token_auth_fallback"
+            },
+            {
+                "title": "POST /negotiations - Отклик на вакансию",
+                "content": """POST /negotiations
+Отклик на вакансию в API hh.ru
 
 POST https://api.hh.ru/negotiations
 Authorization: Bearer {access_token}
@@ -216,12 +306,12 @@ Authorization: Bearer {access_token}
                 "endpoint": "/negotiations",
                 "http_method": "POST",
                 "source_url": "https://api.hh.ru/openapi/redoc#tag/Otkliki",
-                "section_path": "Отклик_на_вакансию"
+                "section_path": "POST_negotiations_create_fallback"
             }
         ]
     
     def update_knowledge_base(self, update_type: str = "manual") -> Dict[str, Any]:
-        """Обновляет базу знаний из OpenAPI и GitHub"""
+        """Обновляет базу знаний из OpenAPI"""
         log_entry = KnowledgeUpdateLog(
             update_type=update_type,
             status="started",
@@ -233,19 +323,22 @@ Authorization: Bearer {access_token}
             db.add(log_entry)
             db.commit()
             
-            # 1. Сначала пробуем загрузить OpenAPI с hh.ru
+            # Загружаем OpenAPI с официального источника
             logger.info("🔄 Загрузка OpenAPI с hh.ru...")
             fragments = self.load_openapi_from_hh()
             
-            # 2. Если OpenAPI не загрузился — пробуем GitHub
+            # Если OpenAPI не загрузился — используем ручные фрагменты ТОЛЬКО для первого запуска
             if not fragments:
-                logger.info("🔄 OpenAPI не загружен, пробуем GitHub...")
-                fragments = self.load_from_github()
-            
-            # 3. Если ничего не загрузилось — используем ручные фрагменты
-            if not fragments:
-                logger.warning("⚠️ Используем ручные фрагменты")
-                fragments = self._get_fallback_fragments()
+                existing_count = db.query(DocFragment).count()
+                if existing_count == 0:
+                    logger.warning("⚠️ Первый запуск: используем демонстрационные фрагменты")
+                    fragments = self._get_fallback_fragments()
+                else:
+                    logger.error("❌ OpenAPI не загрузился, но в БД есть данные. Обновление отменено.")
+                    log_entry.status = "failed"
+                    log_entry.error_message = "OpenAPI не загрузился"
+                    db.commit()
+                    return {"status": "failed", "error": "OpenAPI не загрузился. База знаний не обновлена."}
             
             if not fragments:
                 log_entry.status = "failed"

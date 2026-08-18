@@ -1,7 +1,6 @@
 import os
 import logging
-import requests
-from typing import Optional
+from typing import List, Dict, Any
 from dotenv import load_dotenv
 from app.retriever import Retriever
 from app.database import SessionLocal
@@ -12,87 +11,129 @@ logger = logging.getLogger(__name__)
 
 class YandexAssistant:
     def __init__(self):
-        self.api_key = os.getenv("YANDEX_API_KEY")
-        self.folder_id = os.getenv("YANDEX_FOLDER_ID")
-        self.model = os.getenv("YANDEX_MODEL", "yandexgpt-lite")
-        self.use_yandex = False
         self.retriever = Retriever()
-        
-        if self.api_key and self.folder_id:
-            self.use_yandex = True
-            logger.info("✅ Yandex Assistant инициализирован (режим API)")
-        else:
-            logger.warning("⚠️ Yandex Assistant работает в режиме заглушки")
+        self.mode = "hybrid_search"
+        logger.info("✅ Assistant инициализирован (режим гибридного поиска)")
     
-    def generate_response(self, prompt: str, context: Optional[str] = None) -> str:
-        """Генерирует ответ с использованием Yandex GPT и RAG"""
+    def generate_response(self, prompt: str) -> str:
+        """Генерирует ответ на основе найденных фрагментов"""
         
-        # 1. Ищем в базе знаний через pgvector
         db = SessionLocal()
         try:
             fragments = self.retriever.search(db, prompt)
-            if fragments:
-                context = self.retriever.build_context(fragments)
-                if context:
-                    return self._call_yandex_gpt_with_context(prompt, context)
-            else:
-                return "К сожалению, в документации API hh.ru не найдена информация по вашему запросу. Попробуйте переформулировать вопрос или обратитесь к официальной документации: https://api.hh.ru/openapi/redoc"
+            logger.info(f"🔍 Найдено {len(fragments)} фрагментов для запроса: {prompt[:50]}")
+            
+            if not fragments:
+                return self._no_info_response()
+            
+            return self._build_response_from_fragments(prompt, fragments)
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка в generate_response: {e}")
+            import traceback
+            traceback.print_exc()
+            return f"Произошла ошибка при обработке запроса: {str(e)}"
         finally:
             db.close()
+    
+    def _escape_markdown(self, text: str) -> str:
+        """Экранирует специальные символы для Telegram Markdown"""
+        if not text:
+            return ""
+        special_chars = ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
+        for char in special_chars:
+            text = text.replace(char, f'\\{char}')
+        return text
+    
+    def _build_response_from_fragments(self, prompt: str, fragments: List[Dict[str, Any]]) -> str:
+        """Строит ответ из найденных фрагментов"""
         
-        # Если Yandex недоступен
-        return "Извините, я не могу ответить на этот вопрос."
-    
-    def _call_yandex_gpt(self, prompt: str) -> str:
-        """Вызов Yandex GPT без контекста"""
-        messages = [
-            {"role": "user", "text": prompt}
-        ]
-        return self._call_yandex_api(messages)
-    
-    def _call_yandex_gpt_with_context(self, prompt: str, context: str) -> str:
-        """Вызов Yandex GPT с контекстом из базы знаний"""
-        messages = [
-            {
-                "role": "system",
-                "text": f"Ты — помощник по API hh.ru. Отвечай на вопросы, используя только информацию из контекста. Если в контексте нет ответа, скажи об этом честно.\n\nКонтекст:\n{context}"
-            },
-            {
-                "role": "user",
-                "text": prompt
-            }
-        ]
-        return self._call_yandex_api(messages)
-    
-    def _call_yandex_api(self, messages: list) -> str:
-        """Универсальный вызов Yandex GPT API"""
-        url = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-        headers = {
-            "Authorization": f"Api-Key {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "modelUri": f"gpt://{self.folder_id}/{self.model}",
-            "completionOptions": {
-                "stream": False,
-                "temperature": 0.7,
-                "maxTokens": 1000
-            },
-            "messages": messages
-        }
+        topic = self._detect_topic(prompt)
         
-        try:
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
+        response = f"📚 **Найдена информация по вашему запросу:**\n\n"
+        response += f"**Тема:** {topic}\n\n"
+        
+        for i, f in enumerate(fragments[:5], 1):
+            title = self._escape_markdown(f.get('title', 'Без названия'))
+            response += f"**{i}. {title}**\n"
             
-            if response.status_code == 200:
-                result = response.json()
-                alternatives = result.get('result', {}).get('alternatives', [])
-                if alternatives:
-                    return alternatives[0].get('message', {}).get('text', 'Не удалось получить ответ.')
-                return "Не удалось получить ответ от Yandex GPT."
-            else:
-                logger.error(f"Ошибка Yandex API: {response.status_code} - {response.text}")
-                return "Извините, произошла ошибка при обращении к Yandex GPT."
-        except Exception as e:
-            logger.error(f"Ошибка при запросе к Yandex GPT: {e}")
-            return "Извините, произошла ошибка при обработке запроса."
+            if f.get('http_method') and f.get('endpoint'):
+                method = self._escape_markdown(f['http_method'])
+                endpoint = self._escape_markdown(f['endpoint'])
+                response += f"🔧 **Метод:** `{method} {endpoint}`\n"
+            
+            content = f.get('content', '')
+            if len(content) > 600:
+                content = content[:600] + "..."
+            content = self._escape_markdown(content)
+            response += f"📝 **Описание:**\n```\n{content}\n```\n"
+            
+            if f.get('similarity'):
+                similarity = f['similarity'] * 100
+                response += f"📊 **Релевантность:** {similarity:.1f}%\n"
+            
+            if f.get('source_url'):
+                source_url = self._escape_markdown(f['source_url'])
+                response += f"📖 **Источник:** {source_url}\n"
+            
+            response += "\n---\n\n"
+        
+        response += "💡 **Используйте эти эндпоинты из официальной документации hh.ru.**\n"
+        response += "📖 **Общая документация:** https://api.hh.ru/openapi/redoc"
+        
+        if len(response) > 4000:
+            response = response[:3997] + "..."
+        
+        return response
+    
+    def _detect_topic(self, prompt: str) -> str:
+        """Определяет тему вопроса"""
+        prompt_lower = prompt.lower()
+        
+        topics = {
+            'вакансии': 'Поиск и работа с вакансиями',
+            'вакансия': 'Поиск и работа с вакансиями',
+            'vacancy': 'Поиск и работа с вакансиями',
+            'резюме': 'Поиск и работа с резюме',
+            'resume': 'Поиск и работа с резюме',
+            'авторизация': 'Авторизация и OAuth',
+            'токен': 'Авторизация и OAuth',
+            'oauth': 'Авторизация и OAuth',
+            'auth': 'Авторизация и OAuth',
+            'отклик': 'Отклики на вакансии',
+            'negotiation': 'Отклики на вакансии',
+            'работодатель': 'Работа с работодателями',
+            'employer': 'Работа с работодателями',
+            'поиск': 'Поиск',
+            'создание': 'Создание',
+            'create': 'Создание',
+            'обновление': 'Обновление',
+            'update': 'Обновление',
+            'удаление': 'Удаление',
+            'delete': 'Удаление'
+        }
+        
+        for key, value in topics.items():
+            if key in prompt_lower:
+                return value
+        
+        return 'API hh.ru'
+    
+    def _no_info_response(self) -> str:
+        """Ответ при отсутствии информации"""
+        return """❌ **Информация не найдена**
+
+К сожалению, в документации API hh.ru не найдена информация по вашему запросу.
+
+**Рекомендации:**
+1. Попробуйте переформулировать вопрос
+2. Используйте ключевые слова: вакансии, резюме, авторизация, отклик
+3. Обратитесь к официальной документации:
+   📖 https://api.hh.ru/openapi/redoc
+   📖 https://dev.hh.ru
+
+**Примеры правильных вопросов:**
+- "Как найти вакансии?"
+- "Как авторизоваться в API?"
+- "Как создать резюме?"
+- "Как откликнуться на вакансию?"""
